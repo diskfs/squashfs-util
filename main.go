@@ -113,9 +113,10 @@ func main() {
 	fmt.Printf("version %d.%d\n", major, minor)
 	fmt.Printf("mod time %v\n", time.Unix(int64(modTime), 0))
 	fmt.Printf("flags %#v\n", sFlags)
-	fmt.Printf("root inode block.offset 0x%x.0x%x %d.%d\n", rootInodeBlock, rootInodeOffset, rootInodeBlock, rootInodeOffset)
 
 	data := []printable{
+		{"root inode block", uint64(rootInodeBlock)},
+		{"root inode offset", uint64(rootInodeOffset)},
 		{"filesystem size", uint64(size)},
 		{"inodes", uint64(inodeCount)},
 		{"blocksize", uint64(blockSize)},

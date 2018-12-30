@@ -51,7 +51,7 @@ type printable struct {
 }
 
 func (p *printable) print() string {
-	return fmt.Sprintf("%-30s 0x%-10x %-10d\n", p.name, p.data, p.data)
+	return fmt.Sprintf("%-30s %#10x %10d\n", p.name, p.data, p.data)
 }
 
 func main() {

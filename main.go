@@ -124,7 +124,6 @@ func main() {
 		{"id count", uint64(idCount)},
 		{"id table start", uint64(idTableStart)},
 		{"xattr table start", uint64(xattrTableStart)},
-
 		{"inode table start", uint64(inodeTableStart)},
 		{"directory table start", uint64(dirTableStart)},
 		{"fragment table start", uint64(fragTableStart)},

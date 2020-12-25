@@ -3,15 +3,24 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
+	"path"
 	"time"
 )
 
 const (
 	superblockSize = 96
 	magicByte      = 0x73717368
+	basicDirectory = 1
+	extendedDirectory = 8
+	inodeHeaderSize = 16
+	maxDirEntries   = 256
+	dirHeaderSize   = 12
+	dirEntryMinSize = 8
+	dirNameMaxSize  = 256
 )
 
 type superblockFlags struct {
@@ -45,13 +54,199 @@ func parseFlags(flags uint16) *superblockFlags {
 	return s
 }
 
-type printable struct {
+type printableNumber struct {
 	name string
 	data uint64
 }
 
-func (p *printable) print() string {
+func (p *printableNumber) print() string {
 	return fmt.Sprintf("%-30s %#10x %10d\n", p.name, p.data, p.data)
+}
+
+type inodeHeader struct {
+	inodeType uint16
+	uidIdx    uint16
+	gidIdx    uint16
+	modTime   time.Time
+	index     uint32
+	mode      os.FileMode
+}
+
+type inodePointer struct {
+	path string
+	block uint32
+	offset uint16
+}
+
+func (i *inodePointer) print() string {
+	return fmt.Sprintf("%-30s: %#10x %10d , %#10x %10d\n", i.path, i.block, i.block, i.offset, i.offset)
+}
+
+func readInodeHeader(f io.ReaderAt, offset int64) inodeHeader {
+	b := make ([]byte, inodeHeaderSize)
+	n, err := f.ReadAt(b, offset)
+	if err != nil {
+		log.Fatalf("error reading inode header at %d: %v", offset, err)
+	}
+	if n != len(b) {
+		log.Fatalf("read %d instead of expected %d inode header bytes at %d", n, len(b), offset)
+	}
+	return inodeHeader{
+		inodeType: binary.LittleEndian.Uint16(b[0:2]),
+		mode:      os.FileMode(binary.LittleEndian.Uint16(b[2:4])),
+		uidIdx:    binary.LittleEndian.Uint16(b[4:6]),
+		gidIdx:    binary.LittleEndian.Uint16(b[6:8]),
+		modTime:   time.Unix(int64(binary.LittleEndian.Uint32(b[8:12])), 0),
+		index:     binary.LittleEndian.Uint32(b[12:16]),
+	}
+}
+
+func parseDirectoryInode(b []byte, t uint16) (uint32, uint16, uint16) {
+	var (
+		dirBlockIndex uint32
+		dirSize uint16
+		offset uint16
+	)
+	switch t {
+	case basicDirectory:
+		dirBlockIndex = binary.LittleEndian.Uint32(b[0:4])
+		dirSize = binary.LittleEndian.Uint16(b[8:10])
+		offset = binary.LittleEndian.Uint16(b[10:12])
+	case extendedDirectory:
+		dirBlockIndex = binary.LittleEndian.Uint32(b[8:12])
+		dirSize = binary.LittleEndian.Uint16(b[4:8])
+		offset = binary.LittleEndian.Uint16(b[18:20])
+	}
+	return dirBlockIndex, dirSize, offset
+}
+
+type directoryHeader struct {
+	count      uint32
+	startBlock uint32
+	inode      uint32
+}
+
+type directoryEntryRaw struct {
+	offset         uint16
+	inodeNumber    uint16
+	inodeType      uint16
+	name           string
+	isSubdirectory bool
+	startBlock     uint32
+}
+
+
+// parse the header of a directory
+func parseDirectoryHeader(b []byte) (*directoryHeader, error) {
+	if len(b) < dirHeaderSize {
+		return nil, fmt.Errorf("Header was %d bytes, less than minimum %d", len(b), dirHeaderSize)
+	}
+	return &directoryHeader{
+		count:      binary.LittleEndian.Uint32(b[0:4]) + 1,
+		startBlock: binary.LittleEndian.Uint32(b[4:8]),
+		inode:      binary.LittleEndian.Uint32(b[8:12]),
+	}, nil
+}
+
+// parse a raw directory entry
+func parseDirectoryEntry(b []byte) (*directoryEntryRaw, int, error) {
+	// ensure we have enough bytes to parse
+	if len(b) < dirEntryMinSize {
+		return nil, 0, fmt.Errorf("Directory entry was %d bytes, less than minimum %d", len(b), dirEntryMinSize)
+	}
+
+	offset := binary.LittleEndian.Uint16(b[0:2])
+	inode := binary.LittleEndian.Uint16(b[2:4])
+	nameSize := binary.LittleEndian.Uint16(b[6:8])
+	realNameSize := nameSize + 1
+
+	// make sure name is legitimate size
+	if nameSize > dirNameMaxSize {
+		return nil, 0, fmt.Errorf("Name size was %d bytes, greater than maximum %d", nameSize, dirNameMaxSize)
+	}
+	if int(realNameSize+dirEntryMinSize) > len(b) {
+		return nil, 0, fmt.Errorf("Dir entry plus size of name is %d, larger than available bytes %d", nameSize+dirEntryMinSize, len(b))
+	}
+
+	// read in the name
+	name := string(b[8 : 8+realNameSize])
+	return &directoryEntryRaw{
+		offset:         offset,
+		inodeNumber:    inode,
+		name:           name,
+	}, int(8 + realNameSize), nil
+}
+
+func parseDirectory(p string, b []byte) ([]inodePointer, error) {
+	var entries []inodePointer
+	for pos := 0; pos +dirHeaderSize < len(b); {
+		directoryHeader, err := parseDirectoryHeader(b[pos:])
+		if err != nil {
+			return nil, fmt.Errorf("Could not parse directory header: %v", err)
+		}
+		if directoryHeader.count+1 > maxDirEntries {
+			return nil, fmt.Errorf("Corrupted directory, had %d entries instead of max %d", directoryHeader.count+1, maxDirEntries)
+		}
+		pos += dirHeaderSize
+		for count := uint32(0); count < directoryHeader.count; count++ {
+			entry, size, err := parseDirectoryEntry(b[pos:])
+			if err != nil {
+				return nil, fmt.Errorf("Unable to parse entry at position %d: %v", pos, err)
+			}
+			entry.startBlock = directoryHeader.startBlock
+			entries = append(entries, inodePointer{
+				path: path.Join(p, entry.name),
+				block: entry.startBlock,
+				offset: entry.offset,
+			})
+			// increment the position
+			pos += size
+		}
+	}
+	return entries, nil
+}
+
+func walkTree(f *os.File, inode inodePointer, inodeTable uint64, directoryTable uint64) []inodePointer {
+	ret := []inodePointer{inode}
+	start := inodeTable+uint64(inode.block)+2+uint64(inode.offset)
+	header := readInodeHeader(f, int64(start))
+	// if it is a directory, walk children
+	start += inodeHeaderSize
+	switch header.inodeType {
+	case basicDirectory, extendedDirectory:
+		b := make([]byte, 20)
+		n, err := f.ReadAt(b, int64(start))
+		if err != nil {
+			log.Fatalf("error reading inode body at %d: %v", start, err)
+		}
+		if n != len(b) {
+			log.Fatalf("read %d instead of expected %d bytes for body at %d", n, len(b), start)
+		}
+		dirBlockIndex, dirSize, offset := parseDirectoryInode(b, header.inodeType)
+		// read the directory entries
+		b = make([]byte, dirSize)
+		start = directoryTable+uint64(dirBlockIndex)+2+uint64(offset)
+		n, err = f.ReadAt(b, int64(start))
+		if err != nil {
+			log.Fatalf("error reading directory at %d: %v", start, err)
+		}
+		if n != len(b) {
+			log.Fatalf("read %d instead of expected %d bytes for directory at %d", n, len(b), start)
+		}
+		// read the directory entries until done
+		inodes, err := parseDirectory(inode.path, b)
+		if err != nil {
+			log.Fatalf("error parsing directory at %s: %v", inode.path, err)
+		}
+		for _, in := range inodes {
+			ret = append(ret, walkTree(f, in, inodeTable, directoryTable)...)
+		}
+	}
+	return ret
+}
+
+func parseInodeRef(ref uint64) (uint32, uint16) {
+	return uint32((ref >> 16) & 0xffffffff), uint16(ref & 0xffff)
 }
 
 func main() {
@@ -97,8 +292,7 @@ func main() {
 	major := binary.LittleEndian.Uint16(b[28:30])
 	minor := binary.LittleEndian.Uint16(b[30:32])
 	rootInodeRef := binary.LittleEndian.Uint64(b[32:40])
-	rootInodeBlock := uint32((rootInodeRef >> 16) & 0xffffffff)
-	rootInodeOffset := uint16(rootInodeRef & 0xffff)
+	rootInodeBlock, rootInodeOffset := parseInodeRef(rootInodeRef)
 	size := binary.LittleEndian.Uint64(b[40:48])
 	idTableStart := binary.LittleEndian.Uint64(b[48:56])
 	xattrTableStart := binary.LittleEndian.Uint64(b[56:64])
@@ -108,13 +302,14 @@ func main() {
 	exportTableStart := binary.LittleEndian.Uint64(b[88:96])
 
 	sFlags := parseFlags(flags)
+
 	// print everything
 	fmt.Printf("compression %d\n", compression)
 	fmt.Printf("version %d.%d\n", major, minor)
 	fmt.Printf("mod time %v\n", time.Unix(int64(modTime), 0))
 	fmt.Printf("flags %#v\n", sFlags)
 
-	data := []printable{
+	data := []printableNumber{
 		{"root inode block", uint64(rootInodeBlock)},
 		{"root inode offset", uint64(rootInodeOffset)},
 		{"filesystem size", uint64(size)},
@@ -131,6 +326,11 @@ func main() {
 	}
 
 	for _, d := range data {
+		fmt.Print(d.print())
+	}
+	// now print the filesystem contents
+	files := walkTree(f, inodePointer{"/", rootInodeBlock, rootInodeOffset}, inodeTableStart, dirTableStart)
+	for _, d := range files {
 		fmt.Print(d.print())
 	}
 }

@@ -24,6 +24,25 @@ const (
 	metadataSize      = 8192
 )
 
+type inodeType uint16
+
+const (
+	inodeBasicDirectory    inodeType = 1
+	inodeBasicFile                   = 2
+	inodeBasicSymlink                = 3
+	inodeBasicBlock                  = 4
+	inodeBasicChar                   = 5
+	inodeBasicFifo                   = 6
+	inodeBasicSocket                 = 7
+	inodeExtendedDirectory           = 8
+	inodeExtendedFile                = 9
+	inodeExtendedSymlink             = 10
+	inodeExtendedBlock               = 11
+	inodeExtendedChar                = 12
+	inodeExtendedFifo                = 13
+	inodeExtendedSocket              = 14
+)
+
 type superblockFlags struct {
 	uncompressedInodes    bool
 	uncompressedData      bool
@@ -65,7 +84,7 @@ func (p *printableNumber) print() string {
 }
 
 type inodeHeader struct {
-	inodeType uint16
+	inodeType inodeType
 	uidIdx    uint16
 	gidIdx    uint16
 	modTime   time.Time
@@ -74,16 +93,17 @@ type inodeHeader struct {
 }
 
 type inodePointer struct {
-	path   string
-	block  uint32
-	offset uint16
+	path      string
+	inodeType inodeType
+	block     uint32
+	offset    uint16
 }
 
 func (i *inodePointer) print() string {
-	return fmt.Sprintf("%-30s: %#10x %#10x , %10d %10d\n", i.path, i.block, i.offset, i.block, i.offset)
+	return fmt.Sprintf("%-30s: %20v %#10x %#10x , %10d %10d\n", i.path, i.inodeType, i.block, i.offset, i.block, i.offset)
 }
 func (i *inodePointer) printHeader() string {
-	return fmt.Sprintf("%-30s: %20s, %20s\n", "path", "Inode Hex Block/Offset", "Inode Decimal Block/Offset")
+	return fmt.Sprintf("%-30s: %20s %20s, %20s\n", "path", "type", "Inode Hex Block/Offset", "Inode Decimal Block/Offset")
 }
 
 func readInodeHeader(f io.ReaderAt, offset int64) inodeHeader {
@@ -96,7 +116,7 @@ func readInodeHeader(f io.ReaderAt, offset int64) inodeHeader {
 		log.Fatalf("read %d instead of expected %d inode header bytes at %d", n, len(b), offset)
 	}
 	return inodeHeader{
-		inodeType: binary.LittleEndian.Uint16(b[0:2]),
+		inodeType: inodeType(binary.LittleEndian.Uint16(b[0:2])),
 		mode:      os.FileMode(binary.LittleEndian.Uint16(b[2:4])),
 		uidIdx:    binary.LittleEndian.Uint16(b[4:6]),
 		gidIdx:    binary.LittleEndian.Uint16(b[6:8]),
@@ -105,7 +125,7 @@ func readInodeHeader(f io.ReaderAt, offset int64) inodeHeader {
 	}
 }
 
-func parseDirectoryInode(b []byte, t uint16) (uint32, uint16, uint16) {
+func parseDirectoryInode(b []byte, t inodeType) (uint32, uint16, uint16) {
 	var (
 		dirBlockIndex uint32
 		dirSize       uint16
@@ -133,7 +153,7 @@ type directoryHeader struct {
 type directoryEntryRaw struct {
 	offset         uint16
 	inodeNumber    uint16
-	inodeType      uint16
+	inodeType      inodeType
 	name           string
 	isSubdirectory bool
 	startBlock     uint32
@@ -160,6 +180,7 @@ func parseDirectoryEntry(b []byte) (*directoryEntryRaw, int, error) {
 
 	offset := binary.LittleEndian.Uint16(b[0:2])
 	inode := binary.LittleEndian.Uint16(b[2:4])
+	entryType := inodeType(binary.LittleEndian.Uint16(b[4:6]))
 	nameSize := binary.LittleEndian.Uint16(b[6:8])
 	realNameSize := nameSize + 1
 
@@ -177,6 +198,7 @@ func parseDirectoryEntry(b []byte) (*directoryEntryRaw, int, error) {
 		offset:      offset,
 		inodeNumber: inode,
 		name:        name,
+		inodeType:   entryType,
 	}, int(8 + realNameSize), nil
 }
 
@@ -198,9 +220,10 @@ func parseDirectory(p string, b []byte) ([]inodePointer, error) {
 			}
 			entry.startBlock = directoryHeader.startBlock
 			entries = append(entries, inodePointer{
-				path:   path.Join(p, entry.name),
-				block:  entry.startBlock,
-				offset: entry.offset,
+				path:      path.Join(p, entry.name),
+				block:     entry.startBlock,
+				offset:    entry.offset,
+				inodeType: entry.inodeType,
 			})
 			// increment the position
 			pos += size
@@ -234,7 +257,7 @@ func readMetadataBlock(r io.ReaderAt, location int64) (int, []byte, error) {
 	if n != len(b) {
 		return 0, nil, fmt.Errorf("read %d instead of expected %d bytes for metadata block at location %d", n, len(b), location)
 	}
-	return len(b)+2, b, nil
+	return len(b) + 2, b, nil
 }
 
 // readMetadata read as many bytes of metadata as required for the given size, with the byteOffset provided as a starting
@@ -242,7 +265,7 @@ func readMetadataBlock(r io.ReaderAt, location int64) (int, []byte, error) {
 // requests to read 500 bytes beginning at offset 8000 into the first block.
 func readMetadata(r io.ReaderAt, firstBlock int64, initialBlockOffset uint32, byteOffset uint16, size int) ([]byte, error) {
 	var (
-		b []byte
+		b           []byte
 		blockOffset = int(initialBlockOffset)
 	)
 	// we know how many blocks, so read them all in
@@ -296,6 +319,9 @@ func walkTree(f *os.File, inode inodePointer, inodeTable uint64, directoryTable 
 		for _, in := range inodes {
 			ret = append(ret, walkTree(f, in, inodeTable, directoryTable)...)
 		}
+	}
+	if inode.inodeType != header.inodeType {
+		inode.inodeType = header.inodeType
 	}
 	return ret
 }
@@ -384,7 +410,7 @@ func main() {
 		fmt.Print(d.print())
 	}
 	// now print the filesystem contents
-	files := walkTree(f, inodePointer{"/", rootInodeBlock, rootInodeOffset}, inodeTableStart, dirTableStart)
+	files := walkTree(f, inodePointer{"/", inodeBasicDirectory, rootInodeBlock, rootInodeOffset}, inodeTableStart, dirTableStart)
 	fmt.Println()
 	for i, d := range files {
 		if i == 0 {

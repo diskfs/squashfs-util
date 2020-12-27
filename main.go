@@ -12,15 +12,16 @@ import (
 )
 
 const (
-	superblockSize = 96
-	magicByte      = 0x73717368
-	basicDirectory = 1
+	superblockSize    = 96
+	magicByte         = 0x73717368
+	basicDirectory    = 1
 	extendedDirectory = 8
-	inodeHeaderSize = 16
-	maxDirEntries   = 256
-	dirHeaderSize   = 12
-	dirEntryMinSize = 8
-	dirNameMaxSize  = 256
+	inodeHeaderSize   = 16
+	maxDirEntries     = 256
+	dirHeaderSize     = 12
+	dirEntryMinSize   = 8
+	dirNameMaxSize    = 256
+	metadataSize      = 8192
 )
 
 type superblockFlags struct {
@@ -73,17 +74,20 @@ type inodeHeader struct {
 }
 
 type inodePointer struct {
-	path string
-	block uint32
+	path   string
+	block  uint32
 	offset uint16
 }
 
 func (i *inodePointer) print() string {
-	return fmt.Sprintf("%-30s: %#10x %10d , %#10x %10d\n", i.path, i.block, i.block, i.offset, i.offset)
+	return fmt.Sprintf("%-30s: %#10x %#10x , %10d %10d\n", i.path, i.block, i.offset, i.block, i.offset)
+}
+func (i *inodePointer) printHeader() string {
+	return fmt.Sprintf("%-30s: %20s, %20s\n", "path", "Inode Hex Block/Offset", "Inode Decimal Block/Offset")
 }
 
 func readInodeHeader(f io.ReaderAt, offset int64) inodeHeader {
-	b := make ([]byte, inodeHeaderSize)
+	b := make([]byte, inodeHeaderSize)
 	n, err := f.ReadAt(b, offset)
 	if err != nil {
 		log.Fatalf("error reading inode header at %d: %v", offset, err)
@@ -104,8 +108,8 @@ func readInodeHeader(f io.ReaderAt, offset int64) inodeHeader {
 func parseDirectoryInode(b []byte, t uint16) (uint32, uint16, uint16) {
 	var (
 		dirBlockIndex uint32
-		dirSize uint16
-		offset uint16
+		dirSize       uint16
+		offset        uint16
 	)
 	switch t {
 	case basicDirectory:
@@ -134,7 +138,6 @@ type directoryEntryRaw struct {
 	isSubdirectory bool
 	startBlock     uint32
 }
-
 
 // parse the header of a directory
 func parseDirectoryHeader(b []byte) (*directoryHeader, error) {
@@ -171,15 +174,15 @@ func parseDirectoryEntry(b []byte) (*directoryEntryRaw, int, error) {
 	// read in the name
 	name := string(b[8 : 8+realNameSize])
 	return &directoryEntryRaw{
-		offset:         offset,
-		inodeNumber:    inode,
-		name:           name,
+		offset:      offset,
+		inodeNumber: inode,
+		name:        name,
 	}, int(8 + realNameSize), nil
 }
 
 func parseDirectory(p string, b []byte) ([]inodePointer, error) {
 	var entries []inodePointer
-	for pos := 0; pos +dirHeaderSize < len(b); {
+	for pos := 0; pos+dirHeaderSize < len(b); {
 		directoryHeader, err := parseDirectoryHeader(b[pos:])
 		if err != nil {
 			return nil, fmt.Errorf("Could not parse directory header: %v", err)
@@ -195,8 +198,8 @@ func parseDirectory(p string, b []byte) ([]inodePointer, error) {
 			}
 			entry.startBlock = directoryHeader.startBlock
 			entries = append(entries, inodePointer{
-				path: path.Join(p, entry.name),
-				block: entry.startBlock,
+				path:   path.Join(p, entry.name),
+				block:  entry.startBlock,
 				offset: entry.offset,
 			})
 			// increment the position
@@ -206,9 +209,66 @@ func parseDirectory(p string, b []byte) ([]inodePointer, error) {
 	return entries, nil
 }
 
+func readMetadataBlock(r io.ReaderAt, location int64) (int, []byte, error) {
+	// read the size and compression
+	b := make([]byte, 2)
+	n, err := r.ReadAt(b, location)
+	if err != nil {
+		return 0, nil, fmt.Errorf("could not read size bytes for metadata block at %d: %v", location, err)
+	}
+	if n != len(b) {
+		return 0, nil, fmt.Errorf("read %d instead of expected %d bytes for metadata block at location %d", n, len(b), location)
+	}
+	header := binary.LittleEndian.Uint16(b[:2])
+	size := header & 0x7fff
+	compressed := header&0x8000 != 0x8000
+	// we do not handle compressed yet
+	if compressed {
+		return 0, nil, fmt.Errorf("unable to read compressed metadata blocks yet at location %d", location)
+	}
+	b = make([]byte, size)
+	n, err = r.ReadAt(b, location+2)
+	if err != nil {
+		return 0, nil, fmt.Errorf("could not data size bytes for metadata block at %d: %v", location, err)
+	}
+	if n != len(b) {
+		return 0, nil, fmt.Errorf("read %d instead of expected %d bytes for metadata block at location %d", n, len(b), location)
+	}
+	return len(b)+2, b, nil
+}
+
+// readMetadata read as many bytes of metadata as required for the given size, with the byteOffset provided as a starting
+// point into the first block. Can read multiple blocks if necessary, e.g. if a block is 8192 bytes (standard), and
+// requests to read 500 bytes beginning at offset 8000 into the first block.
+func readMetadata(r io.ReaderAt, firstBlock int64, initialBlockOffset uint32, byteOffset uint16, size int) ([]byte, error) {
+	var (
+		b []byte
+		blockOffset = int(initialBlockOffset)
+	)
+	// we know how many blocks, so read them all in
+	read, m, err := readMetadataBlock(r, firstBlock+int64(blockOffset))
+	if err != nil {
+		return nil, err
+	}
+	b = append(b, m[byteOffset:]...)
+	// do we have any more to read?
+	for len(b) < size {
+		blockOffset += read
+		read, m, err = readMetadataBlock(r, firstBlock+int64(blockOffset))
+		if err != nil {
+			return nil, err
+		}
+		b = append(b, m...)
+	}
+	if len(b) >= size {
+		b = b[:size]
+	}
+	return b, nil
+}
+
 func walkTree(f *os.File, inode inodePointer, inodeTable uint64, directoryTable uint64) []inodePointer {
 	ret := []inodePointer{inode}
-	start := inodeTable+uint64(inode.block)+2+uint64(inode.offset)
+	start := inodeTable + uint64(inode.block) + 2 + uint64(inode.offset)
 	header := readInodeHeader(f, int64(start))
 	// if it is a directory, walk children
 	start += inodeHeaderSize
@@ -224,14 +284,9 @@ func walkTree(f *os.File, inode inodePointer, inodeTable uint64, directoryTable 
 		}
 		dirBlockIndex, dirSize, offset := parseDirectoryInode(b, header.inodeType)
 		// read the directory entries
-		b = make([]byte, dirSize)
-		start = directoryTable+uint64(dirBlockIndex)+2+uint64(offset)
-		n, err = f.ReadAt(b, int64(start))
+		b, err = readMetadata(f, int64(directoryTable), dirBlockIndex, offset, int(dirSize))
 		if err != nil {
 			log.Fatalf("error reading directory at %d: %v", start, err)
-		}
-		if n != len(b) {
-			log.Fatalf("read %d instead of expected %d bytes for directory at %d", n, len(b), start)
 		}
 		// read the directory entries until done
 		inodes, err := parseDirectory(inode.path, b)
@@ -330,7 +385,11 @@ func main() {
 	}
 	// now print the filesystem contents
 	files := walkTree(f, inodePointer{"/", rootInodeBlock, rootInodeOffset}, inodeTableStart, dirTableStart)
-	for _, d := range files {
+	fmt.Println()
+	for i, d := range files {
+		if i == 0 {
+			fmt.Print(d.printHeader())
+		}
 		fmt.Print(d.print())
 	}
 }

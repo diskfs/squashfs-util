@@ -80,7 +80,7 @@ type printableNumber struct {
 }
 
 func (p *printableNumber) print() string {
-	return fmt.Sprintf("%-30s %#10x %10d\n", p.name, p.data, p.data)
+	return fmt.Sprintf("%-30s %#10x %10d", p.name, p.data, p.data)
 }
 
 type inodeHeader struct {
@@ -97,13 +97,20 @@ type inodePointer struct {
 	inodeType inodeType
 	block     uint32
 	offset    uint16
+	dirBlock  uint32
+	dirOffset uint16
+	dirSize   uint16
 }
 
 func (i *inodePointer) print() string {
-	return fmt.Sprintf("%-30s: %20v %#10x %#10x , %10d %10d\n", i.path, i.inodeType, i.block, i.offset, i.block, i.offset)
+	in := fmt.Sprintf("%-30s: %4v %#10x %#10x , %10d %10d", i.path, i.inodeType, i.block, i.offset, i.block, i.offset)
+	if i.dirSize > 0 {
+		in = fmt.Sprintf("%s, %#10x %#10x , %10d %10d, %4d", in, i.dirBlock, i.dirOffset, i.dirBlock, i.dirOffset, i.dirSize)
+	}
+	return in
 }
 func (i *inodePointer) printHeader() string {
-	return fmt.Sprintf("%-30s: %20s %20s, %20s\n", "path", "type", "Inode Hex Block/Offset", "Inode Decimal Block/Offset")
+	return fmt.Sprintf("%-30s: %4s %20s, %20s, %20s, %20s, %4s", "path", "type", "Inode Hex Block/Offset", "Inode Decimal Block/Offset", "Dir Hex Block/Offset", "Dir Decimal Block/Offset", "Dir Size")
 }
 
 func readInodeHeader(f io.ReaderAt, offset int64) inodeHeader {
@@ -202,8 +209,8 @@ func parseDirectoryEntry(b []byte) (*directoryEntryRaw, int, error) {
 	}, int(8 + realNameSize), nil
 }
 
-func parseDirectory(p string, b []byte) ([]inodePointer, error) {
-	var entries []inodePointer
+func parseDirectory(p string, b []byte) ([]*inodePointer, error) {
+	var entries []*inodePointer
 	for pos := 0; pos+dirHeaderSize < len(b); {
 		directoryHeader, err := parseDirectoryHeader(b[pos:])
 		if err != nil {
@@ -219,7 +226,7 @@ func parseDirectory(p string, b []byte) ([]inodePointer, error) {
 				return nil, fmt.Errorf("Unable to parse entry at position %d: %v", pos, err)
 			}
 			entry.startBlock = directoryHeader.startBlock
-			entries = append(entries, inodePointer{
+			entries = append(entries, &inodePointer{
 				path:      path.Join(p, entry.name),
 				block:     entry.startBlock,
 				offset:    entry.offset,
@@ -289,8 +296,8 @@ func readMetadata(r io.ReaderAt, firstBlock int64, initialBlockOffset uint32, by
 	return b, nil
 }
 
-func walkTree(f *os.File, inode inodePointer, inodeTable uint64, directoryTable uint64) []inodePointer {
-	ret := []inodePointer{inode}
+func walkTree(f *os.File, inode *inodePointer, inodeTable uint64, directoryTable uint64) []*inodePointer {
+	ret := []*inodePointer{inode}
 	start := inodeTable + uint64(inode.block) + 2 + uint64(inode.offset)
 	header := readInodeHeader(f, int64(start))
 	// if it is a directory, walk children
@@ -306,6 +313,9 @@ func walkTree(f *os.File, inode inodePointer, inodeTable uint64, directoryTable 
 			log.Fatalf("read %d instead of expected %d bytes for body at %d", n, len(b), start)
 		}
 		dirBlockIndex, dirSize, offset := parseDirectoryInode(b, header.inodeType)
+		inode.dirBlock = dirBlockIndex
+		inode.dirOffset = offset
+		inode.dirSize = dirSize
 		// read the directory entries
 		b, err = readMetadata(f, int64(directoryTable), dirBlockIndex, offset, int(dirSize))
 		if err != nil {
@@ -407,15 +417,15 @@ func main() {
 	}
 
 	for _, d := range data {
-		fmt.Print(d.print())
+		fmt.Println(d.print())
 	}
 	// now print the filesystem contents
-	files := walkTree(f, inodePointer{"/", inodeBasicDirectory, rootInodeBlock, rootInodeOffset}, inodeTableStart, dirTableStart)
+	files := walkTree(f, &inodePointer{"/", inodeBasicDirectory, rootInodeBlock, rootInodeOffset, 0, 0, 0}, inodeTableStart, dirTableStart)
 	fmt.Println()
 	for i, d := range files {
 		if i == 0 {
-			fmt.Print(d.printHeader())
+			fmt.Println(d.printHeader())
 		}
-		fmt.Print(d.print())
+		fmt.Println(d.print())
 	}
 }

@@ -298,7 +298,7 @@ func readMetadata(r io.ReaderAt, firstBlock int64, initialBlockOffset uint32, by
 
 func walkTree(f *os.File, inode *inodePointer, inodeTable uint64, directoryTable uint64) []*inodePointer {
 	ret := []*inodePointer{inode}
-	start := inodeTable + uint64(inode.block*(metadataSize+2)) + 2 + uint64(inode.offset)
+	start := inodeTable + uint64(inode.block) + 2 + uint64(inode.offset)
 	header := readInodeHeader(f, int64(start))
 	// if it is a directory, walk children
 	start += inodeHeaderSize
